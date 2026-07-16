@@ -525,6 +525,15 @@ class InductorChoices:
         num_threads = warp_size * num_warps
 
         if inner_reduction:
+            # Strict numerics: share the split factor with eager via the SAME shared API
+            # (torch._strict_config.strict_split_factor), so eager and Inductor chunk the
+            # reduction axis identically -> the two-stage split sums group the same way ->
+            # bitwise. (Analogous to sharing strict_rblock for R0_BLOCK.) strict_split_factor
+            # returns 1 when there aren't enough outputs to split.
+            if config.numerics == "strict":
+                from torch._strict_config import strict_split_factor
+
+                return strict_split_factor(reduction_numel_hint, numel_hint, num_sm)
             # do heuristics that's close to eager mode for split inner reduction
             # we leak reduction autotune configs here, and will need to refactor to avoid this later
             if numel_hint >= 2 * num_sm:  # don't split if there are enough outputs
