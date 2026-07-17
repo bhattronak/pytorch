@@ -4448,11 +4448,77 @@ class ShapeEnv:
         dest = self.replacements.get(orig_s)
         if dest is not None:
             if free_unbacked_symbols(dest):
-                raise AssertionError(f"{orig_s} -> {dest}")
+                # orig_s already has an unbacked replacement (dest). This can
+                # happen when the same op's unbacked binding is rebound across
+                # multiple retrace passes -- e.g. re-exporting / re-lowering an
+                # ExportedProgram whose graph already carries unbacked_bindings,
+                # so a data-dependent op (such as aten._unique2) is registered
+                # by both ExportedProgram.module() and PropagateUnbackedSymInts.
+                # In that case orig_s, new_s and dest all denote the same runtime
+                # value, so unify them transitively (orig_s -> new_s -> dest) via
+                # the replacements below instead of aborting. This mirrors what
+                # the dest handling below already does when dest is backed.
+                #
+                # This does not mask a genuine inconsistency: _set_replacement
+                # below refines/intersects value ranges and raises
+                # ValueRangeError if new_s and dest are provably different (their
+                # ranges are disjoint). The residual case (same range, different
+                # value) is caught downstream by runtime size asserts / inference
+                # parity checks. Emit a signpost so this rare unify is observable
+                # rather than silent.
+                signpost_event(
+                    "dynamic",
+                    "rename_unbacked_to_unify",
+                    {
+                        "orig_s": str(orig_s),
+                        "new_s": str(new_s),
+                        "dest": str(dest),
+                    },
+                )
+                log.info(
+                    "rename_unbacked_to: unifying %s -> %s (existing dest %s)",
+                    orig_s,
+                    new_s,
+                    dest,
+                )
         self._set_replacement(orig_s, new_s, "rename_unbacked_to")
         self.unbacked_renamings[orig_s] = new_s
         if dest is not None:
-            self._set_replacement(new_s, dest, "rename_unbacked_to_dest")
+            # orig_s, new_s, dest, and new_s's own prior replacement all denote
+            # the same runtime value. Redirect every unbacked alias among them
+            # onto one terminal, preferring a backed terminal so a backed
+            # resolution is never downgraded to an unbacked alias and nothing is
+            # left dangling.
+            existing = self.replacements.get(new_s)
+            aliases = [a for a in (new_s, dest, existing) if a is not None]
+            backed_aliases = [a for a in aliases if not free_unbacked_symbols(a)]
+            terminal = backed_aliases[0] if backed_aliases else dest
+
+            for alias in aliases:
+                # Redirect only unbacked symbols: the terminal needs no redirect,
+                # a replacement key must be a bare Symbol, and backed symbols are
+                # roots that must never be repointed.
+                if (
+                    alias == terminal
+                    or not isinstance(alias, sympy.Symbol)
+                    or not free_unbacked_symbols(alias)
+                ):
+                    continue
+                self._set_replacement(alias, terminal, "rename_unbacked_to_dest")
+                if self.replacements.get(alias) != terminal:
+                    # _set_replacement declined the substitution (e.g. the target
+                    # range is not a subset), leaving alias unreconciled rather
+                    # than unified -- surface it instead of failing silently.
+                    signpost_event(
+                        "dynamic",
+                        "rename_unbacked_to_unify_skipped",
+                        {"alias": str(alias), "terminal": str(terminal)},
+                    )
+                    log.info(
+                        "rename_unbacked_to: could not unify %s -> %s",
+                        alias,
+                        terminal,
+                    )
 
     @record_shapeenv_event()
     def _constrain_is_bounded(self, a: sympy.Symbol, upper_bound: int) -> None:
