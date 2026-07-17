@@ -11,6 +11,7 @@
 #include <torch/csrc/autograd/function.h>
 #include <torch/csrc/autograd/functions/basic_ops.h>
 #include <torch/csrc/autograd/python_anomaly_mode.h>
+#include <torch/csrc/autograd/python_context.h>
 #include <torch/csrc/autograd/python_cpp_function.h>
 #include <torch/csrc/autograd/python_function.h>
 #include <torch/csrc/autograd/python_saved_variable_hooks.h>
@@ -349,6 +350,11 @@ static PyObject* THPEngine_run_backward(
 
   variable_list outputs;
   {
+    // Seed ThreadLocalState with the current Python context before the engine
+    // snapshots and propagates it to autograd worker threads.
+    at::ThreadLocalState thread_locals;
+    thread_locals.set_python_context(copy_current_py_context());
+    at::ThreadLocalStateGuard tls_guard(thread_locals);
     pybind11::gil_scoped_release no_gil;
     auto& engine = python::PythonEngine::get_python_engine();
     outputs = engine.execute(
@@ -387,7 +393,11 @@ static PyObject* THPEngine_queue_callback(PyObject* self, PyObject* _callback) {
   Py_INCREF(_callback);
   engine.queue_callback([callback]() {
     pybind11::gil_scoped_acquire gil;
-    THPObjectPtr result{PyObject_CallFunctionObjArgs(callback.get(), nullptr)};
+    THPObjectPtr args{PyTuple_New(0)};
+    if (!args) {
+      throw_persisted_python_error();
+    }
+    THPObjectPtr result{call_with_context(callback.get(), args.get())};
     if (!result) {
       // Note [ Persisting PyErr state across autograd engine threads ]
       //
@@ -403,9 +413,7 @@ static PyObject* THPEngine_queue_callback(PyObject* self, PyObject* _callback) {
       // python_hooks.cpp for more details. Persisting an extra time in the
       // engine is fine because doing so is a no-op when the python_error has
       // already been persisted.
-      python_error err;
-      err.persist();
-      throw std::move(err);
+      throw_persisted_python_error();
     }
   });
   Py_RETURN_NONE;
