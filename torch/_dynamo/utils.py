@@ -3979,6 +3979,27 @@ def _wrap_graph_break_with_torch_runtime_err(gb_fn: Callable[[], NoReturn]) -> N
     raise AssertionError("should be unreachable")
 
 
+_INTERNAL_FAKE_TENSOR_RUNTIME_ERRORS: tuple[type[BaseException], ...] = (
+    # These signal fake/meta execution bookkeeping failures, not eager
+    # RuntimeErrors from the user op. New fake tensor internal RuntimeError
+    # subclasses must be listed here or converted to FakeTensorInternalError.
+    torch._subclasses.fake_tensor.DataDependentOutputException,
+    torch._subclasses.fake_tensor.DynamicOutputShapeException,
+    torch._subclasses.fake_tensor.FakeTensorDeviceMismatchError,
+    torch._subclasses.fake_tensor.FakeTensorInternalError,
+    torch._subclasses.fake_tensor.MetadataMismatchError,
+    torch._subclasses.fake_tensor.UnsupportedFakeTensorException,
+    torch._subclasses.fake_tensor.UnsupportedMutationAliasingException,
+    torch._subclasses.fake_tensor.UnsupportedOperatorException,
+)
+
+
+def _can_raise_fake_runtime_error_to_user(cause: BaseException) -> bool:
+    return isinstance(cause, RuntimeError) and not isinstance(
+        cause, _INTERNAL_FAKE_TENSOR_RUNTIME_ERRORS
+    )
+
+
 def get_fake_value(
     node: torch.fx.Node,
     tx: InstructionTranslatorBase,
@@ -4007,7 +4028,13 @@ def _get_fake_value_impl(
     from torch.utils._sympy.value_ranges import ValueRangeError
 
     from . import graph_break_hints
-    from .exc import unimplemented, Unsupported, UserError, UserErrorType
+    from .exc import (
+        raise_observed_exception,
+        unimplemented,
+        Unsupported,
+        UserError,
+        UserErrorType,
+    )
 
     op = node.op
 
@@ -4190,6 +4217,18 @@ def _get_fake_value_impl(
                 hints=[*graph_break_hints.USER_ERROR],
                 from_exc=cause,
             )
+        elif _can_raise_fake_runtime_error_to_user(cause):
+            runtime_error = cast(RuntimeError, cause)
+            msg = get_concrete_sizes_from_symints(str(e), fake_mode)
+            tx.output.remove_node(node)
+            raise_observed_exception(
+                type(runtime_error),
+                tx,
+                unsafe_to_inspect=True,
+                fake_tensor_error=cause,
+                fake_mode=fake_mode,
+                fake_tensor_explanation=msg,
+            )
         msg = get_concrete_sizes_from_symints(str(e), fake_mode)
         _wrap_graph_break_with_torch_runtime_err(
             lambda: unimplemented(
@@ -4258,10 +4297,21 @@ def run_node(
 
     with set_current_node(node):
 
+        def safe_exception_repr(e: Any) -> str:
+            if not isinstance(e, BaseException):
+                return repr(e)
+            if not e.args:
+                args_repr = ""
+            elif all(type(arg) is str for arg in e.args):
+                args_repr = ", ".join(repr(arg) for arg in e.args)
+            else:
+                args_repr = "<non-string args>"
+            return f"{type(e).__name__}({args_repr})"
+
         def make_error_message(e: Any) -> str:
             return (
                 f"Dynamo failed to run FX node with fake tensors: {op} {node.target}(*{args}, **{kwargs}): got "
-                + repr(e)
+                + safe_exception_repr(e)
             )
 
         from .exc import Unsupported
